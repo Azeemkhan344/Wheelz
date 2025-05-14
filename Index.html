@@ -1,0 +1,571 @@
+// =============================================================
+// Scripts/GameManager.cs
+// =============================================================
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using System; // For DateTime
+
+public class GameManager : MonoBehaviour
+{
+    public static GameManager Instance { get; private set; }
+
+    public int Score { get; private set; }
+    public int Lives { get; private set; }
+    public int Coins { get; private set; } // Total coins player has
+    public int CurrentLevelCoins { get; private set; } // Coins collected in current level
+
+    public enum GameState { Menu, Playing, Paused, GameOver, LevelComplete }
+    public GameState CurrentState { get; private set; }
+
+    public int currentLevelIndex = 0; // Or load from PlayerData
+    // Array of level scene names or ScriptableObjects for level data
+    public string[] levelScenes; // e.g., "Level1", "Level2" (Add these to Build Settings)
+
+    public float timeLimitPerLevel = 60f; // Example
+    private float currentTime;
+
+    public event Action<int> OnScoreChanged;
+    public event Action<int> OnLivesChanged;
+    public event Action<int> OnCoinsChanged; // Total coins
+    public event Action<int> OnCurrentLevelCoinsChanged;
+    public event Action<GameState> OnGameStateChanged;
+    public event Action<float> OnTimeChanged;
+
+    private const string LastDailyRewardKey = "LastDailyRewardTime";
+    private const int DailyRewardAmount = 100; // Coins
+
+    void Awake()
+    {
+        if (Instance == null)
+        {
+            Instance = this;
+            DontDestroyOnLoad(gameObject);
+            LoadPlayerData(); // Load coins, unlocked items etc.
+        }
+        else
+        {
+            Destroy(gameObject);
+        }
+    }
+
+    void Start()
+    {
+        // Initialize with main menu state if this GameManager persists across scenes
+        if (SceneManager.GetActiveScene().name == "MainMenu") // Assuming you have a MainMenu scene
+        {
+            SetState(GameState.Menu);
+            CheckDailyReward(); // Check daily reward when game starts (on Main Menu)
+        }
+    }
+     void OnEnable()
+    {
+        SceneManager.sceneLoaded += OnSceneLoaded;
+    }
+
+    void OnDisable()
+    {
+        SceneManager.sceneLoaded -= OnSceneLoaded;
+    }
+
+    void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        // If we loaded a level scene and game state is supposed to be Playing
+        bool isLevelScene = false;
+        for(int i=0; i<levelScenes.Length; ++i) {
+            if(levelScenes[i] == scene.name) {
+                isLevelScene = true;
+                currentLevelIndex = i; // Update current level index based on scene name
+                break;
+            }
+        }
+
+        if (isLevelScene)
+        {
+            // If GameManager initiated the level load, it would have set state to Playing.
+            // If loading a level scene directly (e.g. for testing), set it up.
+            if (CurrentState != GameState.Playing && CurrentState != GameState.Paused) {
+                 // This ensures if we directly load a level scene (e.g. for testing),
+                 // the game starts correctly.
+                Score = 0;
+                CurrentLevelCoins = 0;
+                // Lives are persistent
+                currentTime = timeLimitPerLevel; // Or level specific time
+
+                OnScoreChanged?.Invoke(Score);
+                OnLivesChanged?.Invoke(Lives);
+                OnCurrentLevelCoinsChanged?.Invoke(CurrentLevelCoins);
+                OnTimeChanged?.Invoke(currentTime);
+                SetState(GameState.Playing);
+            }
+            // Ensure player reference is found if needed by player controller or other scripts after scene load
+            // FindObjectOfType<PlayerController>()?.Initialize(); // Example
+        } else if (scene.name == "MainMenu") {
+            SetState(GameState.Menu);
+            Time.timeScale = 1f; // Ensure time is normal in menu
+        }
+    }
+
+
+    public void StartGame() // Called from UI button
+    {
+        currentLevelIndex = PlayerDataManager.Instance.GetLastPlayedLevel();
+        // Ensure level index is valid
+        if (currentLevelIndex >= levelScenes.Length || currentLevelIndex < 0) {
+            currentLevelIndex = 0; // Default to first level if out of bounds
+        }
+        LoadLevel(currentLevelIndex);
+    }
+
+    private void LoadLevel(int levelIndex)
+    {
+        if (levelIndex < 0 || levelIndex >= levelScenes.Length)
+        {
+            Debug.LogError($"Invalid level index: {levelIndex}. Max is {levelScenes.Length -1}");
+            GoToMainMenu(); // Go back to menu if level is invalid
+            return;
+        }
+
+        this.currentLevelIndex = levelIndex;
+        Score = 0;
+        CurrentLevelCoins = 0;
+        // Lives persist
+        currentTime = timeLimitPerLevel; // Or fetch level-specific time
+
+        OnScoreChanged?.Invoke(Score);
+        OnLivesChanged?.Invoke(Lives);
+        OnCurrentLevelCoinsChanged?.Invoke(CurrentLevelCoins);
+        OnTimeChanged?.Invoke(currentTime);
+
+        SetState(GameState.Playing);
+        Time.timeScale = 1f;
+        SceneManager.LoadScene(levelScenes[levelIndex]);
+    }
+
+
+    void Update()
+    {
+        if (CurrentState == GameState.Playing)
+        {
+            currentTime -= Time.deltaTime;
+            OnTimeChanged?.Invoke(currentTime);
+            if (currentTime <= 0)
+            {
+                currentTime = 0; // Prevent negative time display
+                OnTimeChanged?.Invoke(currentTime); // Update UI one last time
+                LoseLife(); // Handle out of time
+            }
+        }
+    }
+
+    public void AddScore(int amount)
+    {
+        Score += amount;
+        OnScoreChanged?.Invoke(Score);
+    }
+
+    public void CollectCoin(int amount = 1)
+    {
+        CurrentLevelCoins += amount;
+        Coins += amount;
+        OnCurrentLevelCoinsChanged?.Invoke(CurrentLevelCoins);
+        OnCoinsChanged?.Invoke(Coins);
+        PlayerDataManager.Instance.SaveCoins(Coins);
+    }
+
+    public void CollectStar()
+    {
+        AddScore(100);
+    }
+
+    public void LoseLife()
+    {
+        if (CurrentState != GameState.Playing) return; // Don't lose life if not playing
+
+        Lives--;
+        OnLivesChanged?.Invoke(Lives);
+        PlayerDataManager.Instance.SaveLives(Lives);
+
+        if (Lives <= 0)
+        {
+            SetState(GameState.GameOver);
+            UIManager.Instance.ShowGameOverScreen();
+        }
+        else
+        {
+            // Player lost a life but has more - restart current level
+            RestartLevel();
+        }
+    }
+
+    public void GrantExtraLife(int amount = 1)
+    {
+        bool wasGameOver = (CurrentState == GameState.GameOver && Lives <=0);
+        Lives += amount;
+        OnLivesChanged?.Invoke(Lives);
+        PlayerDataManager.Instance.SaveLives(Lives);
+
+        if (wasGameOver && Lives > 0)
+        {
+            // If game was over and now has life, allow restart
+            UIManager.Instance.HideGameOverScreen(); // Assuming this method exists or is handled by state change
+            RestartLevel(); // Or go to a "Try Again" state before restarting
+        }
+    }
+
+
+    public void LevelCompleted()
+    {
+        if (CurrentState != GameState.Playing) return;
+
+        SetState(GameState.LevelComplete);
+        PlayerDataManager.Instance.SaveCoins(Coins); // Already saved incrementally, but good for final sync
+        PlayerDataManager.Instance.UpdateHighScore(currentLevelIndex, Score);
+        PlayerDataManager.Instance.MarkLevelComplete(currentLevelIndex);
+        if (currentLevelIndex + 1 < levelScenes.Length)
+        {
+            PlayerDataManager.Instance.UnlockLevel(currentLevelIndex + 1);
+            PlayerDataManager.Instance.SetLastPlayedLevel(currentLevelIndex + 1);
+        } else {
+            // Last level completed, could set last played to 0 or special marker
+            PlayerDataManager.Instance.SetLastPlayedLevel(0);
+        }
+        LeaderboardManager.Instance?.SubmitScore(Score);
+        UIManager.Instance.ShowLevelCompleteScreen(Score, CurrentLevelCoins);
+    }
+
+    public void NextLevel()
+    {
+        if (currentLevelIndex + 1 < levelScenes.Length)
+        {
+            LoadLevel(currentLevelIndex + 1);
+        }
+        else
+        {
+            Debug.Log("All levels completed!");
+            GoToMainMenu();
+        }
+    }
+
+    public void RestartLevel()
+    {
+        // Reload the current level scene
+        // State should be set to Playing before loading the scene
+        // The OnSceneLoaded callback will handle re-initialization of level-specific data
+        // Reset lives if it's a "start from scratch" restart.
+        // Here, lives are persistent, so we just reload.
+        LoadLevel(currentLevelIndex); // This sets state to playing and loads scene
+    }
+
+    public void PauseGame()
+    {
+        if (CurrentState == GameState.Playing)
+        {
+            SetState(GameState.Paused);
+            Time.timeScale = 0f;
+            UIManager.Instance.ShowPauseScreen();
+        }
+    }
+
+    public void ResumeGame()
+    {
+        if (CurrentState == GameState.Paused)
+        {
+            SetState(GameState.Playing);
+            Time.timeScale = 1f;
+            UIManager.Instance.HidePauseScreen();
+        }
+    }
+
+    public void GoToMainMenu()
+    {
+        Time.timeScale = 1f;
+        SetState(GameState.Menu);
+        SceneManager.LoadScene("MainMenu");
+    }
+
+
+    public void SetState(GameState newState)
+    {
+        if (CurrentState == newState) return;
+        CurrentState = newState;
+        OnGameStateChanged?.Invoke(newState);
+        Debug.Log("Game State Changed: " + newState);
+    }
+
+
+    private void LoadPlayerData()
+    {
+        Lives = PlayerDataManager.Instance.LoadLives(3);
+        Coins = PlayerDataManager.Instance.LoadCoins();
+        OnCoinsChanged?.Invoke(Coins);
+        OnLivesChanged?.Invoke(Lives);
+    }
+
+    public void AddCoins(int amount)
+    {
+        Coins += amount;
+        OnCoinsChanged?.Invoke(Coins);
+        PlayerDataManager.Instance.SaveCoins(Coins);
+    }
+
+    // --- Daily Reward ---
+    public void CheckDailyReward()
+    {
+        string lastRewardTimeString = PlayerPrefs.GetString(LastDailyRewardKey, "");
+        if (string.IsNullOrEmpty(lastRewardTimeString))
+        {
+            UIManager.Instance.ShowDailyRewardPrompt(DailyRewardAmount, true);
+        }
+        else
+        {
+            DateTime lastRewardTime = DateTime.Parse(lastRewardTimeString);
+            if ((DateTime.UtcNow - lastRewardTime).TotalHours >= 24)
+            {
+                UIManager.Instance.ShowDailyRewardPrompt(DailyRewardAmount, true);
+            }
+            else
+            {
+                UIManager.Instance.ShowDailyRewardPrompt(DailyRewardAmount, false, (lastRewardTime.AddHours(24) - DateTime.UtcNow));
+            }
+        }
+    }
+
+    public void ClaimDailyReward()
+    {
+        AddCoins(DailyRewardAmount);
+        PlayerPrefs.SetString(LastDailyRewardKey, DateTime.UtcNow.ToString());
+        PlayerPrefs.Save();
+        UIManager.Instance.HideDailyRewardPrompt();
+        Debug.Log($"Daily reward of {DailyRewardAmount} coins claimed!");
+    }
+}
+
+
+// =============================================================
+// Scripts/PlayerController.cs
+// =============================================================
+// using UnityEngine; // Already declared above
+
+public class PlayerController : MonoBehaviour
+{
+    public float moveSpeed = 5f;
+    private Rigidbody2D rb;
+    private Vector2 moveDirection = Vector2.right;
+    private Vector2 nextMoveDirection;
+    private bool canChangeDirectionAtNextJunction = false; // Flag to change at next grid point / junction
+    private bool isMoving = true;
+
+    public SpriteRenderer hamsterSpriteRenderer;
+    public Animator hamsterAnimator;
+
+    private Vector3 targetGridPosition; // For grid-based movement, target position
+    private bool isAtGridCenter = true; // Start at a grid center
+
+    public float gridSize = 1f; // Assuming 1 unit grid for maze simplicity
+
+    void Awake()
+    {
+        rb = GetComponent<Rigidbody2D>();
+        if (rb == null) Debug.LogError("PlayerController requires a Rigidbody2D component.");
+
+        // Snap to grid initially
+        transform.position = new Vector3(
+            Mathf.Round(transform.position.x / gridSize) * gridSize,
+            Mathf.Round(transform.position.y / gridSize) * gridSize,
+            transform.position.z
+        );
+        targetGridPosition = transform.position;
+        nextMoveDirection = moveDirection; // Initialize nextMoveDirection
+        LoadOutfit();
+    }
+
+    void Update()
+    {
+        if (GameManager.Instance.CurrentState != GameManager.GameState.Playing)
+        {
+            isMoving = false; // Ensure player doesn't move if not in Playing state
+            if (hamsterAnimator) hamsterAnimator.SetBool("IsMoving", false);
+            return;
+        }
+
+        HandleInput();
+
+        // Animator update based on actual movement
+        if (rb.velocity.magnitude > 0.1f && isMoving)
+        {
+            if (hamsterAnimator) hamsterAnimator.SetBool("IsMoving", true);
+        }
+        else
+        {
+            if (hamsterAnimator) hamsterAnimator.SetBool("IsMoving", false);
+        }
+    }
+
+    void FixedUpdate()
+    {
+        if (GameManager.Instance.CurrentState != GameManager.GameState.Playing || !isMoving)
+        {
+            rb.velocity = Vector2.zero;
+            return;
+        }
+
+        // Simplified Grid-based movement logic:
+        // Move towards targetGridPosition. If reached, check for direction change.
+        Vector2 currentPosition = transform.position;
+        isAtGridCenter = Vector2.Distance(currentPosition, targetGridPosition) < 0.05f; // Tolerance
+
+        if (isAtGridCenter)
+        {
+            transform.position = targetGridPosition; // Snap to grid center
+
+            if (canChangeDirectionAtNextJunction)
+            {
+                // Check if new direction is valid (not into a wall immediately)
+                if (IsDirectionClear(nextMoveDirection))
+                {
+                    moveDirection = nextMoveDirection;
+                    UpdateSpriteDirection();
+                }
+                else // Hit a wall trying to turn
+                {
+                    // Stop or try previous direction
+                    rb.velocity = Vector2.zero;
+                    isMoving = false; // Stop if turn is blocked
+                                      // Or: nextMoveDirection = moveDirection; // Revert to current direction
+                }
+                canChangeDirectionAtNextJunction = false;
+            }
+
+            // Set new target for next grid cell if path is clear
+            if (IsDirectionClear(moveDirection))
+            {
+                targetGridPosition += (Vector3)moveDirection * gridSize;
+                isMoving = true; // Allow movement
+            }
+            else
+            {
+                rb.velocity = Vector2.zero; // Hit a wall in current direction
+                isMoving = false; // Stop
+            }
+        }
+
+        // Move towards target if not at center yet
+        if (isMoving && !isAtGridCenter)
+        {
+            Vector2 directionToTarget = (targetGridPosition - transform.position).normalized;
+            rb.velocity = directionToTarget * moveSpeed;
+        } else if (isMoving && isAtGridCenter && IsDirectionClear(moveDirection)) {
+            // If at center and can move, ensure velocity is set for next step
+             rb.velocity = moveDirection * moveSpeed;
+        } else {
+            rb.velocity = Vector2.zero; // Should stop if blocked or at target waiting for input
+        }
+    }
+
+    void HandleInput()
+    {
+        // One-touch control: tap to queue a direction change
+        if (Input.GetMouseButtonDown(0) || (Input.touchCount > 0 && Input.GetTouch(0).phase == TouchPhase.Began))
+        {
+            if (UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject(Input.touchCount > 0 ? Input.GetTouch(0).fingerId : -1))
+            {
+                return; // Click was on UI
+            }
+
+            // Cycle through directions: Right -> Up -> Left -> Down
+            if (moveDirection == Vector2.right) nextMoveDirection = Vector2.up;
+            else if (moveDirection == Vector2.up) nextMoveDirection = Vector2.left;
+            else if (moveDirection == Vector2.left) nextMoveDirection = Vector2.down;
+            else if (moveDirection == Vector2.down) nextMoveDirection = Vector2.right;
+
+            canChangeDirectionAtNextJunction = true;
+
+            // If already at a grid center, try to turn immediately
+            if (isAtGridCenter)
+            {
+                if (IsDirectionClear(nextMoveDirection))
+                {
+                    moveDirection = nextMoveDirection;
+                    UpdateSpriteDirection();
+                    targetGridPosition = transform.position + (Vector3)moveDirection * gridSize; // Recalculate target
+                    isMoving = true;
+                }
+                else // Turn is blocked
+                {
+                     // Revert nextMoveDirection or keep it queued
+                    nextMoveDirection = moveDirection; // Revert for now
+                }
+                canChangeDirectionAtNextJunction = false; // Processed the input
+            }
+        }
+    }
+
+    bool IsDirectionClear(Vector2 direction)
+    {
+        // Raycast a short distance to check for walls
+        // Adjust raycast distance based on player size and grid cell boundaries
+        float raycastDistance = gridSize * 0.6f; // Slightly more than half grid size
+        RaycastHit2D hit = Physics2D.Raycast((Vector2)transform.position + direction * (gridSize*0.1f) , direction, raycastDistance, LayerMask.GetMask("Wall"));
+        return hit.collider == null;
+    }
+
+
+    void UpdateSpriteDirection()
+    {
+        if (hamsterSpriteRenderer == null) return;
+
+        if (moveDirection == Vector2.right)
+        {
+            hamsterSpriteRenderer.flipX = false;
+            // transform.eulerAngles = new Vector3(0, 0, 0); // Or use sprite rotation
+        }
+        else if (moveDirection == Vector2.left)
+        {
+            hamsterSpriteRenderer.flipX = true;
+            // transform.eulerAngles = new Vector3(0, 0, 180);
+        }
+        // Add rotations or different sprites for up/down if needed
+        // else if (moveDirection == Vector2.up) { transform.eulerAngles = new Vector3(0,0,90); }
+        // else if (moveDirection == Vector2.down) { transform.eulerAngles = new Vector3(0,0,-90); }
+    }
+
+    void OnTriggerEnter2D(Collider2D other)
+    {
+        if (other.CompareTag("Coin"))
+        {
+            GameManager.Instance.CollectCoin();
+            Destroy(other.gameObject);
+        }
+        else if (other.CompareTag("Star"))
+        {
+            GameManager.Instance.CollectStar();
+            Destroy(other.gameObject);
+        }
+        else if (other.CompareTag("Obstacle"))
+        {
+            Debug.Log("Hit Obstacle");
+            GameManager.Instance.LoseLife();
+            // Could also add a small knockback or temporary invulnerability
+            // For simplicity, direct life loss and level restart (if lives run out)
+        }
+        else if (other.CompareTag("Exit"))
+        {
+            isMoving = false;
+            rb.velocity = Vector2.zero;
+            GameManager.Instance.LevelCompleted();
+        }
+        // Wall collisions are handled by raycasts in FixedUpdate/IsDirectionClear
+        // But a trigger could also be used for "bonk" effect or sound
+        // if (other.CompareTag("Wall")) { Debug.Log("Player Triggered Wall"); }
+    }
+
+
+    public void ApplySpeedBoost(float multiplier, float duration)
+    {
+        StartCoroutine(SpeedBoostCoroutine(multiplier, duration));
+    }
+
+    System.Collections.IEnumerator SpeedBoostCoroutine(float multiplier, float duration)
+    {
+        float originalSpeed = moveSpeed;
+        moveSpee
